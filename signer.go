@@ -2,42 +2,73 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 )
 
-func SingleHash(in, out chan interface{}) {
-	defer close(out)
-	for input := range in {
-		data := fmt.Sprintf("%v", input)
+func ExecutePipeline(jobs ...job) {
+	wg := &sync.WaitGroup{}
+	in := make(chan interface{})
 
-		crc32Chan := make(chan string)
-		crc32Md5Chan := make(chan string)
+	for _, j := range jobs {
+		out := make(chan interface{}) // Создаем НОВЫЙ канал для каждой стадии
+		wg.Add(1)
 
-		go func(){
-			crc32Chan <- DataSignerCrc32(data)
-		}()
-		go func(){
-			md5Data := DataSignerMd5(data)
-			crc32Md5Chan <- DataSignerCrc32(md5Data)
-		}()
-
-		out <- (<-crc32Chan) + "~" + (<-crc32Md5Chan)
+		go func(currentJob job, input, output chan interface{}) {
+			defer wg.Done()
+			defer close(output) // Важно: закрываем выход, чтобы следующая стадия вышла из range
+			currentJob(input, output)
+		}(j, in, out)
+		in = out // Выход текущей стадии становится входом для следующей
 	}
+
+	wg.Wait()
 }
 
-func MultiHash(in, out chan interface{}){
-	var wg sync.WaitGroup
+var md5Lock sync.Mutex // Глобальный или переданный мьютекс
+
+func SingleHash(in, out chan interface{}) {
+	wg := &sync.WaitGroup{}
+	for input := range in {
+		wg.Add(1)
+
+		go func(data interface{}) {
+			defer wg.Done()
+			strData := fmt.Sprintf("%v", data)
+
+			// 1. Сначала вычисляем MD5 (строго последовательно)
+			md5Lock.Lock()
+			md5Data := DataSignerMd5(strData)
+			md5Lock.Unlock()
+
+			// 2. Затем запускаем CRC32 (их можно вызывать параллельно)
+			crc32Chan := make(chan string)
+			crc32Md5Chan := make(chan string)
+
+			go func() { crc32Chan <- DataSignerCrc32(strData) }()
+			go func() { crc32Md5Chan <- DataSignerCrc32(md5Data) }()
+
+			// 3. Собираем результат
+			res := (<-crc32Chan) + "~" + (<-crc32Md5Chan)
+			out <- res
+		}(input)
+	}
+	wg.Wait()
+}
+
+func MultiHash(in, out chan interface{}) {
+	wg := &sync.WaitGroup{}
 	for singleHashResult := range in {
 		wg.Add(1)
-		go func(result interface{}){
+		go func(result interface{}) {
 			defer wg.Done()
-			var innerWg sync.WaitGroup
+			innerWg := &sync.WaitGroup{}
 			collection := make([]string, 6)
-			for i:=0; i<=5; i++{
+			for i := 0; i <= 5; i++ {
 				innerWg.Add(1)
 				concatenated := fmt.Sprintf("%v%v", i, result)
-				go func (index int) {
+				go func(index int) {
 					collection[index] = DataSignerCrc32(concatenated)
 					defer innerWg.Done()
 				}(i)
@@ -47,36 +78,18 @@ func MultiHash(in, out chan interface{}){
 		}(singleHashResult)
 
 	}
-
-	go func(){
-		wg.Wait()
-		close(out)
-	}()
+	wg.Wait()
 
 }
 
-func main (){
-	fmt.Println("Testing SingleHash")
-
-	in := make(chan interface{})
-	out := make(chan interface{})
-	out1 := make(chan interface{})
-	go SingleHash(in, out)
-	go MultiHash(out, out1)
-	
-	go func(){
-		in <-0
-		in <-1
-		in <-2
-		close(in)
-	}()
-	
-	fmt.Println("Results:")
-    var results []string
-    for input := range out1 {
-        results = append(results, fmt.Sprintf("%v", input))
-    }
-    
-    fmt.Println(strings.Join(results, "_"))
+func CombineResults(in, out chan interface{}) {
+	var results []string
+	for res := range in {
+		results = append(results, res.(string))
+	}
+	sort.Strings(results)
+	out <- strings.Join(results, "_")
 }
 
+func main() {
+}
